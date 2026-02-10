@@ -3,6 +3,11 @@ declare(strict_types=1);
 
 header('Content-Type: application/json');
 
+<?php
+echo "Learning Hub Sync API is alive";
+exit;
+
+
 function require_api_key(): void {
     $need = getenv('API_KEY') ?: '';
     if ($need === '') return; // not recommended, but prevents lockout
