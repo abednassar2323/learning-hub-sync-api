@@ -1,0 +1,6 @@
+RewriteEngine On
+
+# If the requested path is not a real file or folder, send it to index.php
+RewriteCond %{REQUEST_FILENAME} !-f
+RewriteCond %{REQUEST_FILENAME} !-d
+RewriteRule ^ index.php [QSA,L]
