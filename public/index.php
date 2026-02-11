@@ -18,28 +18,60 @@ function bearer_token(): string {
 }
 
 function require_auth(): void {
-    $expected = $_ENV['SYNC_API_KEY'] ?? getenv('SYNC_API_KEY') ?: '';
-    if ($expected === '') json_out(500, ['error' => 'SYNC_API_KEY not configured']);
+    $expected = getenv('SYNC_API_KEY') ?: '';
+    if ($expected === '') {
+        json_out(500, ['error' => 'SYNC_API_KEY not configured']);
+    }
+
     $token = bearer_token();
-    if ($token === '' || !hash_equals($expected, $token)) json_out(401, ['error' => 'Unauthorized']);
+    if ($token === '' || !hash_equals($expected, $token)) {
+        json_out(401, ['error' => 'Unauthorized']);
+    }
 }
 
+/* ===========================
+   FIXED MYSQL CONNECTION
+=========================== */
 function get_pdo(): PDO {
-    $host = $_ENV['MYSQLHOST'] ?? getenv('MYSQLHOST');
-    $port = $_ENV['MYSQLPORT'] ?? getenv('MYSQLPORT') ?: 3306;
-    $db   = $_ENV['MYSQLDATABASE'] ?? getenv('MYSQLDATABASE');
-    $user = $_ENV['MYSQLUSER'] ?? getenv('MYSQLUSER');
-    $pass = $_ENV['MYSQLPASSWORD'] ?? getenv('MYSQLPASSWORD');
+    $host = getenv('MYSQLHOST');
+    $port = getenv('MYSQLPORT') ?: 3306;
+    $db   = getenv('MYSQLDATABASE');
+    $user = getenv('MYSQLUSER');
+    $pass = getenv('MYSQLPASSWORD');
 
-    if (!$host || !$db || !$user) json_out(500, ['error' => 'MySQL environment variables missing']);
+    if (!$host || !$db || !$user) {
+        json_out(500, [
+            'error' => 'MySQL environment variables missing',
+            'debug' => [
+                'MYSQLHOST' => $host,
+                'MYSQLDATABASE' => $db,
+                'MYSQLUSER' => $user
+            ]
+        ]);
+    }
 
-    return new PDO(
-        "mysql:host=$host;port=$port;dbname=$db;charset=utf8mb4",
-        $user,
-        $pass,
-        [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]
-    );
+    try {
+        return new PDO(
+            "mysql:host={$host};port={$port};dbname={$db};charset=utf8mb4",
+            $user,
+            $pass,
+            [
+                PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+                PDO::ATTR_TIMEOUT => 5,
+                PDO::MYSQL_ATTR_INIT_COMMAND => "SET NAMES utf8mb4"
+            ]
+        );
+    } catch (PDOException $e) {
+        json_out(500, [
+            'error' => 'MySQL connection failed',
+            'message' => $e->getMessage()
+        ]);
+    }
 }
+
+/* ===========================
+   TABLES
+=========================== */
 
 function ensure_db_table(PDO $pdo): void {
     $pdo->exec("
@@ -65,7 +97,6 @@ function ensure_uploads_table(PDO $pdo): void {
     ");
 }
 
-/* NEW: meta table to track last push */
 function ensure_meta_table(PDO $pdo): void {
     $pdo->exec("
         CREATE TABLE IF NOT EXISTS sync_meta (
@@ -85,20 +116,18 @@ function ensure_meta_table(PDO $pdo): void {
         )
     ");
 
-    // Ensure a single row always exists (id=1)
     $pdo->exec("INSERT IGNORE INTO sync_meta (id) VALUES (1)");
 }
 
 function read_meta(PDO $pdo): array {
     ensure_meta_table($pdo);
     $stmt = $pdo->query("SELECT * FROM sync_meta WHERE id = 1");
-    $row = $stmt->fetch(PDO::FETCH_ASSOC);
-    return $row ?: [];
+    return $stmt->fetch(PDO::FETCH_ASSOC) ?: [];
 }
 
-/* ===============================
+/* ===========================
    ROUTES
-================================ */
+=========================== */
 
 if ($method === 'GET' && ($path === '/' || $path === '')) {
     json_out(200, ['service' => 'learning-hub-sync-api', 'status' => 'ok']);
@@ -108,15 +137,10 @@ if ($method === 'GET' && $path === '/health') {
     json_out(200, ['status' => 'healthy', 'time' => date('c')]);
 }
 
-/* NEW: GET /last_sync (shows last push info for DB + uploads) */
 if ($method === 'GET' && $path === '/last_sync') {
     require_auth();
     $pdo = get_pdo();
     $meta = read_meta($pdo);
-
-    if (!$meta) {
-        json_out(200, ['message' => 'No sync meta yet']);
-    }
 
     json_out(200, [
         'last_db' => [
@@ -135,7 +159,10 @@ if ($method === 'GET' && $path === '/last_sync') {
     ]);
 }
 
-// POST /push (DB)
+/* ===========================
+   PUSH DB
+=========================== */
+
 if ($method === 'POST' && $path === '/push') {
     require_auth();
 
@@ -144,7 +171,9 @@ if ($method === 'POST' && $path === '/push') {
     }
 
     $bytes = file_get_contents($_FILES['db']['tmp_name']);
-    if ($bytes === false) json_out(500, ['error' => 'Failed to read uploaded file']);
+    if ($bytes === false) {
+        json_out(500, ['error' => 'Failed to read uploaded file']);
+    }
 
     $size = strlen($bytes);
     $sha  = hash('sha256', $bytes);
@@ -155,20 +184,19 @@ if ($method === 'POST' && $path === '/push') {
     $stmt = $pdo->prepare("INSERT INTO sync_snapshots (sha256, size_bytes, sqlite_blob) VALUES (?, ?, ?)");
     $stmt->execute([$sha, $size, $bytes]);
 
-    // NEW: write meta
     ensure_meta_table($pdo);
+
     $device = trim((string)($_POST['device_name'] ?? 'Unknown'));
     $pushed = trim((string)($_POST['pushed_at'] ?? date('c')));
 
-    $stmt2 = $pdo->prepare("
+    $pdo->prepare("
         UPDATE sync_meta
         SET last_db_pushed_by = ?,
             last_db_pushed_at = ?,
             last_db_sha256 = ?,
             last_db_size_bytes = ?
         WHERE id = 1
-    ");
-    $stmt2->execute([$device, $pushed, $sha, $size]);
+    ")->execute([$device, $pushed, $sha, $size]);
 
     json_out(200, [
         'status' => 'ok',
@@ -178,27 +206,32 @@ if ($method === 'POST' && $path === '/push') {
     ]);
 }
 
-// GET /pull (DB)
+/* ===========================
+   PULL DB
+=========================== */
+
 if ($method === 'GET' && $path === '/pull') {
     require_auth();
-
     $pdo = get_pdo();
     ensure_db_table($pdo);
 
     $stmt = $pdo->query("SELECT sha256, size_bytes, sqlite_blob FROM sync_snapshots ORDER BY id DESC LIMIT 1");
     $row = $stmt->fetch(PDO::FETCH_ASSOC);
 
-    if (!$row) json_out(404, ['error' => 'No snapshot available']);
+    if (!$row) {
+        json_out(404, ['error' => 'No snapshot available']);
+    }
 
     header('Content-Type: application/x-sqlite3');
-    header('Content-Disposition: attachment; filename="learninghub.sqlite"');
-    header('X-SHA256: ' . $row['sha256']);
-    header('X-Size-Bytes: ' . $row['size_bytes']);
+    header('Content-Disposition: attachment; filename=\"learninghub.sqlite\"');
     echo $row['sqlite_blob'];
     exit;
 }
 
-// POST /push_uploads (ZIP)
+/* ===========================
+   PUSH UPLOADS
+=========================== */
+
 if ($method === 'POST' && $path === '/push_uploads') {
     require_auth();
 
@@ -207,7 +240,9 @@ if ($method === 'POST' && $path === '/push_uploads') {
     }
 
     $bytes = file_get_contents($_FILES['zip']['tmp_name']);
-    if ($bytes === false) json_out(500, ['error' => 'Failed to read uploaded zip']);
+    if ($bytes === false) {
+        json_out(500, ['error' => 'Failed to read uploaded zip']);
+    }
 
     $size = strlen($bytes);
     $sha  = hash('sha256', $bytes);
@@ -215,23 +250,22 @@ if ($method === 'POST' && $path === '/push_uploads') {
     $pdo = get_pdo();
     ensure_uploads_table($pdo);
 
-    $stmt = $pdo->prepare("INSERT INTO uploads_snapshots (sha256, size_bytes, zip_blob) VALUES (?, ?, ?)");
-    $stmt->execute([$sha, $size, $bytes]);
+    $pdo->prepare("INSERT INTO uploads_snapshots (sha256, size_bytes, zip_blob) VALUES (?, ?, ?)")
+        ->execute([$sha, $size, $bytes]);
 
-    // NEW: write meta
     ensure_meta_table($pdo);
+
     $device = trim((string)($_POST['device_name'] ?? 'Unknown'));
     $pushed = trim((string)($_POST['pushed_at'] ?? date('c')));
 
-    $stmt2 = $pdo->prepare("
+    $pdo->prepare("
         UPDATE sync_meta
         SET last_uploads_pushed_by = ?,
             last_uploads_pushed_at = ?,
             last_uploads_sha256 = ?,
             last_uploads_size_bytes = ?
         WHERE id = 1
-    ");
-    $stmt2->execute([$device, $pushed, $sha, $size]);
+    ")->execute([$device, $pushed, $sha, $size]);
 
     json_out(200, [
         'status' => 'ok',
@@ -241,25 +275,26 @@ if ($method === 'POST' && $path === '/push_uploads') {
     ]);
 }
 
-// GET /pull_uploads (ZIP)
+/* ===========================
+   PULL UPLOADS
+=========================== */
+
 if ($method === 'GET' && $path === '/pull_uploads') {
     require_auth();
-
     $pdo = get_pdo();
     ensure_uploads_table($pdo);
 
     $stmt = $pdo->query("SELECT sha256, size_bytes, zip_blob FROM uploads_snapshots ORDER BY id DESC LIMIT 1");
     $row = $stmt->fetch(PDO::FETCH_ASSOC);
 
-    if (!$row) json_out(404, ['error' => 'No uploads snapshot available']);
+    if (!$row) {
+        json_out(404, ['error' => 'No uploads snapshot available']);
+    }
 
     header('Content-Type: application/zip');
-    header('Content-Disposition: attachment; filename="uploads.zip"');
-    header('X-SHA256: ' . $row['sha256']);
-    header('X-Size-Bytes: ' . $row['size_bytes']);
+    header('Content-Disposition: attachment; filename=\"uploads.zip\"');
     echo $row['zip_blob'];
     exit;
 }
 
-// Fallback
-json_out(404, ['error' => 'Not Found', 'path' => $path, 'method' => $method]);
+json_out(404, ['error' => 'Not Found']);
